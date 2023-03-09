@@ -28,6 +28,11 @@ ifeq ($(CONFIG_ARCH_RV64I),y)
 	KBUILD_CFLAGS += -mabi=lp64
 	KBUILD_AFLAGS += -mabi=lp64
 
+# workaround for C906 ldd performance issue
+ifeq ($(CONFIG_ARCH_CVITEK),y)
+	KBUILD_CFLAGS += -mno-ldd
+endif
+
 	KBUILD_LDFLAGS += -melf64lriscv
 else
 	BITS := 32
@@ -47,6 +52,9 @@ riscv-march-aflags-$(CONFIG_ARCH_RV32I)		:= rv32ima
 riscv-march-aflags-$(CONFIG_ARCH_RV64I)		:= rv64ima
 riscv-march-aflags-$(CONFIG_FPU)		:= $(riscv-march-aflags-y)fd
 riscv-march-aflags-$(CONFIG_RISCV_ISA_C)	:= $(riscv-march-aflags-y)c
+riscv-march-aflags-$(CONFIG_VECTOR_1_0)		:= $(riscv-march-aflags-y)v
+riscv-march-aflags-$(CONFIG_VECTOR_0_7)		:= $(riscv-march-aflags-y)v0p7
+riscv-march-aflags-$(CONFIG_RISCV_ISA_THEAD)	:= $(riscv-march-aflags-y)xthead
 riscv-march-aflags-$(CONFIG_THEAD_ISA)		:= $(riscv-march-aflags-y)_xtheadc
 
 # ISA string setting
@@ -61,6 +69,8 @@ KBUILD_AFLAGS += -march=$(riscv-march-aflags-y)
 
 KBUILD_CFLAGS += -mno-save-restore
 KBUILD_CFLAGS += -DCONFIG_PAGE_OFFSET=$(CONFIG_PAGE_OFFSET)
+
+machine-$(CONFIG_ARCH_CVITEK)       += cvitek
 
 ifeq ($(CONFIG_CMODEL_MEDLOW),y)
 	KBUILD_CFLAGS += -mcmodel=medlow
