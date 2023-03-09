@@ -27,6 +27,18 @@
 #include "of_private.h"
 
 #define MAX_RESERVED_REGIONS	64
+
+#if defined(CONFIG_ARCH_CVITEK)
+#undef MAX_RESERVED_REGIONS
+#define MAX_RESERVED_REGIONS	4
+struct reserved_mem_size_entry {
+	char *uname;
+	phys_addr_t size;
+};
+static struct reserved_mem_size_entry reserved_mem_size_array[MAX_RESERVED_REGIONS];
+static int reserved_mem_size_entry_count;
+#endif
+
 static struct reserved_mem reserved_mem[MAX_RESERVED_REGIONS];
 static int reserved_mem_count;
 
@@ -69,7 +81,7 @@ void __init fdt_reserved_mem_save_node(unsigned long node, const char *uname,
 	}
 
 	rmem->fdt_node = node;
-	rmem->name = uname;
+	strncpy(rmem->name, uname, 8);
 	rmem->base = base;
 	rmem->size = size;
 
