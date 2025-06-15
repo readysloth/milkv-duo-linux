@@ -33,6 +33,10 @@
 #include <linux/of_gpio.h>
 #include <linux/mmc/slot-gpio.h>
 #include <linux/ktime.h>
+#include <linux/clk.h>
+#include <linux/sizes.h>
+#include <linux/dma-mapping.h>
+#include <linux/kernel.h>
 
 #include "../../core/card.h"
 #include "../sdhci-pltfm.h"
@@ -61,6 +65,9 @@
 		__res |= resp[__off - 1] << ((32 - __shft) % 32);   \
 	__res & __mask;                                         \
 	})
+
+#define BOUNDARY_OK(addr, len) \
+	((addr | (SZ_128M - 1)) == ((addr + len - 1) | (SZ_128M - 1)))
 
 static struct proc_dir_entry *proc_cvi_dir;
 
@@ -482,6 +489,17 @@ int cvi_sdio_rescan(void)
 }
 EXPORT_SYMBOL_GPL(cvi_sdio_rescan);
 
+// register sysfs
+static ssize_t rescan_store(struct device *dev, struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	// mmc rescan
+	cvi_sdio_rescan();
+
+	return count;
+}
+
+static DEVICE_ATTR(rescan, 0200, NULL, rescan_store);
 
 void sdhci_cvi_emmc_voltage_switch(struct sdhci_host *host)
 {
@@ -1020,6 +1038,25 @@ static void sdhci_cv180x_sd_dump_vendor_regs(struct sdhci_host *host)
 		SDHCI_DUMP(": clk_sd0 %d MHz\n", FPLL_MHZ/4);
 }
 
+static void cvi_adma_write_desc(struct sdhci_host *host, void **desc,
+		dma_addr_t addr, int len, unsigned int cmd)
+{
+	int tmplen, offset;
+
+	if (likely(!len || BOUNDARY_OK(addr, len))) {
+		sdhci_adma_write_desc(host, desc, addr, len, cmd);
+		return;
+	}
+
+	offset = addr & (SZ_128M - 1);
+	tmplen = SZ_128M - offset;
+	sdhci_adma_write_desc(host, desc, addr, tmplen, cmd);
+
+	addr += tmplen;
+	len -= tmplen;
+	sdhci_adma_write_desc(host, desc, addr, len, cmd);
+}
+
 static const struct sdhci_ops sdhci_cv180x_emmc_ops = {
 	.reset = sdhci_cv180x_emmc_reset,
 	.set_clock = sdhci_set_clock,
@@ -1030,6 +1067,7 @@ static const struct sdhci_ops sdhci_cv180x_emmc_ops = {
 	.platform_execute_tuning = sdhci_cv180x_general_execute_tuning,
 	.select_drive_strength = sdhci_cv180x_general_select_drive_strength,
 	.dump_vendor_regs = sdhci_cv180x_emmc_dump_vendor_regs,
+	.adma_write_desc = cvi_adma_write_desc,
 };
 
 static const struct sdhci_ops sdhci_cv180x_sd_ops = {
@@ -1043,6 +1081,7 @@ static const struct sdhci_ops sdhci_cv180x_sd_ops = {
 	.platform_execute_tuning = sdhci_cv180x_general_execute_tuning,
 	.select_drive_strength = sdhci_cv180x_general_select_drive_strength,
 	.dump_vendor_regs = sdhci_cv180x_sd_dump_vendor_regs,
+	.adma_write_desc = cvi_adma_write_desc,
 };
 
 static const struct sdhci_ops sdhci_cv180x_sdio_ops = {
@@ -1054,6 +1093,7 @@ static const struct sdhci_ops sdhci_cv180x_sdio_ops = {
 	.set_uhs_signaling = sdhci_cvi_general_set_uhs_signaling,
 	.select_drive_strength = sdhci_cv180x_general_select_drive_strength,
 	.platform_execute_tuning = sdhci_cv180x_general_execute_tuning,
+	.adma_write_desc = cvi_adma_write_desc,
 };
 
 static const struct sdhci_ops sdhci_cv180x_fpga_emmc_ops = {
@@ -1095,8 +1135,8 @@ static const struct sdhci_pltfm_data sdhci_cv180x_sd_pdata = {
 
 static const struct sdhci_pltfm_data sdhci_cv180x_sdio_pdata = {
 	.ops = &sdhci_cv180x_sdio_ops,
-	.quirks = SDHCI_QUIRK_INVERTED_WRITE_PROTECT | SDHCI_QUIRK_CAP_CLOCK_BASE_BROKEN,
-	.quirks2 = SDHCI_QUIRK2_PRESET_VALUE_BROKEN | SDHCI_QUIRK2_NO_1_8_V,
+	.quirks = SDHCI_QUIRK_INVERTED_WRITE_PROTECT | SDHCI_QUIRK_CAP_CLOCK_BASE_BROKEN | SDHCI_QUIRK_BROKEN_ADMA,
+	.quirks2 = SDHCI_QUIRK2_PRESET_VALUE_BROKEN | SDHCI_QUIRK2_NO_1_8_V | SDHCI_QUIRK2_BROKEN_64_BIT_DMA,
 };
 
 static const struct sdhci_pltfm_data sdhci_cv180x_fpga_emmc_pdata = {
@@ -1193,6 +1233,7 @@ static int sdhci_cvi_probe(struct platform_device *pdev)
 	const struct sdhci_pltfm_data *pdata;
 	int ret;
 	int gpio_cd = -EINVAL;
+	u32 extra;
 
 	pr_info(DRIVER_NAME ":%s\n", __func__);
 
@@ -1258,6 +1299,13 @@ static int sdhci_cvi_probe(struct platform_device *pdev)
 			}
 		}
 	}
+	/*
+	 * extra adma table cnt for cross 128M boundary handling.
+	 */
+	extra = DIV_ROUND_UP_ULL(dma_get_required_mask(&pdev->dev), SZ_128M);
+	if (extra > SDHCI_MAX_SEGS)
+		extra = SDHCI_MAX_SEGS;
+	host->adma_table_cnt += extra;
 
 	ret = sdhci_add_host(host);
 	if (ret)
@@ -1265,9 +1313,12 @@ static int sdhci_cvi_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, cvi_host);
 
-	if (strstr(dev_name(mmc_dev(host->mmc)), "wifi-sd"))
+	if (strstr(dev_name(mmc_dev(host->mmc)), "wifi-sd")) {
 		wifi_mmc = host->mmc;
-	else
+
+		if (device_create_file(&host->mmc->class_dev, &dev_attr_rescan))
+			pr_err("Fail to create rescan sysfs file.\n");
+	} else
 		wifi_mmc = NULL;
 
 	/* device proc entry */
