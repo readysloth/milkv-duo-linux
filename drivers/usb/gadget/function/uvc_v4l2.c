@@ -199,6 +199,20 @@ uvc_send_response(struct uvc_device *uvc, struct uvc_request_data *data)
  * V4L2 ioctls
  */
 
+struct uvc_format {
+	u8 bpp;
+	u32 fcc;
+};
+
+static struct uvc_format uvc_formats[] = {
+	{ 16, V4L2_PIX_FMT_YUYV  },
+	{ 0,  V4L2_PIX_FMT_MJPEG },
+#if IS_ENABLED(CONFIG_ARCH_CVITEK)
+	{ 0,  V4L2_PIX_FMT_H264 },
+	{ 0,  V4L2_PIX_FMT_HEVC },
+#endif
+};
+
 static int
 uvc_v4l2_querycap(struct file *file, void *fh, struct v4l2_capability *cap)
 {
