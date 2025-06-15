@@ -1069,3 +1069,10 @@ config MMC_LITEX
 	  module will be called litex_mmc.
 
 	  If unsure, say N.
+
+config ENABLE_EMMC_HW_RESET_QFN
+	bool "Enable EMMC hardware reset for QFN"
+	default N
+	help
+	  "y": Enable EMMC hardware reset in linux for qfn(use GPIOA[19](JTAG_CPU_TMS) to reset)
+	  "n": Enable EMMC hardware reset in linux for bga(must set hardware opt first)
