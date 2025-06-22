@@ -23,6 +23,7 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
+#include <linux/genalloc.h>
 #include <trace/events/kmem.h>
 #ifdef CONFIG_COMPAT
 #include "compat_ion.h"
@@ -193,8 +194,7 @@ static void ion_buffer_kmap_put(struct ion_buffer *buffer)
 	}
 }
 
-static struct sg_table *dup_sg_table(struct sg_table *table,
-				     bool preserve_dma_address)
+static struct sg_table *dup_sg_table(struct sg_table *table)
 {
 	struct sg_table *new_table;
 	int ret, i;
@@ -213,8 +213,7 @@ static struct sg_table *dup_sg_table(struct sg_table *table,
 	new_sg = new_table->sgl;
 	for_each_sgtable_sg(table, sg, i) {
 		memcpy(new_sg, sg, sizeof(*sg));
-		if (!preserve_dma_address)
-			new_sg->dma_address = 0;
+		new_sg->dma_address = 0;
 		new_sg = sg_next(new_sg);
 	}
 
@@ -231,7 +230,6 @@ struct ion_dma_buf_attachment {
 	struct device *dev;
 	struct sg_table *table;
 	struct list_head list;
-	bool no_map;
 };
 
 static int ion_dma_buf_attach(struct dma_buf *dmabuf,
@@ -245,10 +243,7 @@ static int ion_dma_buf_attach(struct dma_buf *dmabuf,
 	if (!a)
 		return -ENOMEM;
 
-	if (buffer->heap->type == ION_HEAP_TYPE_UNMAPPED)
-		a->no_map = true;
-
-	table = dup_sg_table(buffer->sg_table, a->no_map);
+	table = dup_sg_table(buffer->sg_table);
 	if (IS_ERR(table)) {
 		kfree(a);
 		return -ENOMEM;
@@ -267,8 +262,8 @@ static int ion_dma_buf_attach(struct dma_buf *dmabuf,
 	return 0;
 }
 
-static void ion_dma_buf_detatch(struct dma_buf *dmabuf,
-				struct dma_buf_attachment *attachment)
+static void ion_dma_buf_detach(struct dma_buf *dmabuf,
+			       struct dma_buf_attachment *attachment)
 {
 	struct ion_dma_buf_attachment *a = attachment->priv;
 	struct ion_buffer *buffer = dmabuf->priv;
@@ -290,9 +285,6 @@ static struct sg_table *ion_map_dma_buf(struct dma_buf_attachment *attachment,
 
 	table = a->table;
 
-	if (a->no_map)
-		return table;
-
 	ret = dma_map_sgtable(attachment->dev, table, direction, 0);
 	if (ret)
 		return ERR_PTR(ret);
@@ -304,11 +296,6 @@ static void ion_unmap_dma_buf(struct dma_buf_attachment *attachment,
 			      struct sg_table *table,
 			      enum dma_data_direction direction)
 {
-	struct ion_dma_buf_attachment *a = attachment->priv;
-
-	if (a->no_map)
-		return;
-
 	dma_unmap_sgtable(attachment->dev, table, direction, 0);
 }
 
@@ -462,7 +449,7 @@ static const struct dma_buf_ops dma_buf_ops = {
 	.mmap = ion_mmap,
 	.release = ion_dma_buf_release,
 	.attach = ion_dma_buf_attach,
-	.detach = ion_dma_buf_detatch,
+	.detach = ion_dma_buf_detach,
 	.begin_cpu_access = ion_dma_buf_begin_cpu_access,
 	.end_cpu_access = ion_dma_buf_end_cpu_access,
 	.vmap = ion_dma_buf_vmap,
@@ -550,6 +537,84 @@ int ion_alloc(size_t len, unsigned int heap_id_mask, unsigned int flags, struct 
 	return fd;
 }
 
+static int __update_max_avail_size(struct gen_pool_chunk *chunk,
+	u32 size_in_bit, int order, uint64_t *max_avail_size)
+{
+	unsigned long *map = chunk->bits;
+	uint64_t region_len;
+	u32 free_index_start;
+	u32 free_index_end = 0;
+
+	while (free_index_end < size_in_bit) {
+		free_index_start = find_next_zero_bit(map, size_in_bit, free_index_end);
+		if (free_index_start >= size_in_bit) {
+			break;
+		}
+		free_index_end = find_next_bit(map, size_in_bit, free_index_start);
+
+		region_len = (free_index_end - free_index_start) << order;
+		if (region_len > *max_avail_size) {
+			*max_avail_size = region_len;
+		}
+	}
+	return 0;
+}
+
+static int _ion_update_memory_state(struct ion_heap *heap,
+	uint64_t *total_size, uint64_t *free_size, uint64_t *max_avail_size)
+{
+	int end_bit;
+	struct gen_pool *pool;
+	struct gen_pool_chunk *chunk;
+	int order;
+	unsigned long chunk_size;
+	int ret = 0;
+
+	if (heap->type != ION_HEAP_TYPE_CARVEOUT)
+		return -1;
+
+	pool = ion_carveout_get_pool(heap);
+	order = pool->min_alloc_order;
+
+	#ifndef CONFIG_ARCH_HAVE_NMI_SAFE_CMPXCHG
+	if (in_nmi())
+		return -1;
+	#endif
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(chunk, &pool->chunks, next_chunk) {
+		chunk_size = chunk->end_addr - chunk->start_addr + 1;
+		*total_size += chunk_size;
+		*free_size += atomic_long_read(&chunk->avail);
+		end_bit = chunk_size >> order;
+		ret = __update_max_avail_size(chunk, end_bit, order, max_avail_size);
+		if (ret) {
+			pr_err("%s: update max avail size fail, chunk addr:%llu ret:%d.\n",
+				__func__, chunk->start_addr, ret);
+		}
+	}
+	rcu_read_unlock();
+
+	return 0;
+}
+
+int ion_get_memory_state(uint64_t *total_size, uint64_t *free_size, uint64_t *max_avail_size)
+{
+	struct ion_device *dev = internal_dev;
+	struct ion_heap *heap;
+
+	*total_size = 0;
+	*free_size = 0;
+	*max_avail_size = 0;
+
+	down_read(&dev->lock);
+	plist_for_each_entry(heap, &dev->heaps, node) {
+		_ion_update_memory_state(heap, total_size, free_size, max_avail_size);
+	}
+	up_read(&dev->lock);
+
+	return 0;
+}
 #else
 int ion_alloc(size_t len, unsigned int heap_id_mask, unsigned int flags)
 {
